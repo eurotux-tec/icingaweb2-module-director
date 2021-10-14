@@ -6,6 +6,8 @@ use Icinga\Module\Director\Hook\JobHook;
 use Icinga\Module\Director\Web\Form\DirectorObjectForm;
 use Icinga\Module\Director\Web\Form\QuickForm;
 use Icinga\Module\Director\Objects\SyncRule;
+use Icinga\Module\Director\IcingaConfig\IcingaConfig;
+use Icinga\Exception\IcingaException;
 
 class SyncJob extends JobHook
 {
@@ -14,17 +16,48 @@ class SyncJob extends JobHook
     /**
      * @throws \Icinga\Exception\NotFoundError
      * @throws \Icinga\Module\Director\Exception\DuplicateKeyException
+     * @throws \Icinga\Exception\IcingaException
      */
     public function run()
     {
         $db = $this->db();
         $id = $this->getSetting('rule_id');
+
+        $deploy = $this->getSetting('deploy');
+        if ($deploy === 'y') {
+            $safe_to_deploy = $db->countActivitiesSinceLastDeployedConfig() == 0;
+        }
+
+        $made_changes = false;
         if ($id === '__ALL__') {
             foreach (SyncRule::loadAll($db) as $rule) {
-                $this->runForRule($rule);
+                if ($this->runForRule($rule)) {
+                    $made_changes = true;
+                }
             }
         } else {
-            $this->runForRule(SyncRule::loadWithAutoIncId((int) $id, $db));
+            $made_changes = $this->runForRule(SyncRule::loadWithAutoIncId((int) $id, $db));
+        }
+
+        if ($made_changes) {
+            if ($deploy === 'f' || ($deploy === 'y' && $safe_to_deploy)) {
+                $config = IcingaConfig::generate($db);
+                $api = $this->db()->getDeploymentEndpoint()->api();
+                $api->wipeInactiveStages($db);
+    
+                $checksum = $config->getHexChecksum();
+                $current = $api->getActiveChecksum($db);
+                if ($current === $checksum) {
+                    echo "Config matches active stage, nothing to do\n";
+                    return;
+                }
+    
+                if ($api->dumpConfig($config, $db)) {
+                    printf("Config '%s' has been deployed\n", $checksum);
+                } else {
+                    throw new IcingaException('Failed to deploy config "%s"', $checksum);
+                }
+            }
         }
     }
 
@@ -35,7 +68,8 @@ class SyncJob extends JobHook
     public function exportSettings()
     {
         $settings = [
-            'apply_changes' => $this->getSetting('apply_changes') === 'y'
+            'apply_changes' => $this->getSetting('apply_changes') === 'y',
+            'deploy' => in_array($this->getSetting('deploy'), array('y','f'), true)
         ];
         $id = $this->getSetting('rule_id');
         if ($id !== '__ALL__') {
@@ -48,14 +82,16 @@ class SyncJob extends JobHook
 
     /**
      * @param SyncRule $rule
+     * @return bool
      * @throws \Icinga\Module\Director\Exception\DuplicateKeyException
      */
     protected function runForRule(SyncRule $rule)
     {
         if ($this->getSetting('apply_changes') === 'y') {
-            $rule->applyChanges();
+            return $rule->applyChanges();
         } else {
             $rule->checkForChanges();
+            return false;
         }
     }
 
@@ -96,12 +132,31 @@ class SyncJob extends JobHook
                 . ' job still makes sense. You will be made aware of available changes'
                 . ' in your Director GUI.'
             ),
+            'class'        => 'autosubmit',
             'value'        => 'n',
             'multiOptions' => array(
                 'y'  => $form->translate('Yes'),
                 'n'  => $form->translate('No'),
             )
         ));
+
+        if ($form->getSentOrObjectSetting('apply_changes') === 'y') {
+            $form->addElement('select', 'deploy', array(
+                'label'        => $form->translate('Deploy'),
+                'description'  => $form->translate(
+                    'In case you also want the configuration to be automatically deployed'
+                    . ' when changes are made by this Sync job. For safety, the deploy is'
+                    . ' normally only made if no other pending changes already exist, but'
+                    . ' you can choose "Yes (Forced)" to override that.'
+                ),
+                'value'        => 'n',
+                'multiOptions' => array(
+                    'y'  => $form->translate('Yes'),
+                    'f'  => $form->translate('Yes (Forced)'),
+                    'n'  => $form->translate('No'),
+                )
+            ));
+        }
 
         if (! strlen($form->getSentOrObjectValue('job_name'))) {
             if (($ruleId = $form->getSentValue('rule_id')) && array_key_exists($ruleId, $rules)) {
